@@ -1,8 +1,10 @@
 // src/App.tsx
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import axios from 'axios';
+import { Document, Packer, Paragraph, TextRun } from 'docx';
+import { saveAs } from 'file-saver';
 import './App.css';
-import { parseDocument } from './utils/documentParser';
+import { parseDocument, applyResumeTemplate } from './utils/documentParser';
 
 interface KeywordAnalysis {
   jobKeywords: string[];
@@ -11,34 +13,59 @@ interface KeywordAnalysis {
   score: number;
 }
 
+interface ResumeEdit {
+  originalText: string;
+  enhancedText: string;
+  changes: string[];
+  templateName?: string;
+}
+
 const App: React.FC = () => {
   const [jobDescription, setJobDescription] = useState<string>('');
+  const [resumeText, setResumeText] = useState<string>('');
   const [file, setFile] = useState<File | null>(null);
   const [fileName, setFileName] = useState<string>('');
+  const [fileFormat, setFileFormat] = useState<string>('');
+  const [fileStructure, setFileStructure] = useState<any>(null);
   const [apiKey, setApiKey] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(false);
-  const [result, setResult] = useState<KeywordAnalysis | null>(null);
+  const [keywordResult, setKeywordResult] = useState<KeywordAnalysis | null>(null);
+  const [resumeEdit, setResumeEdit] = useState<ResumeEdit | null>(null);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [isProcessingFile, setIsProcessingFile] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<'original' | 'enhanced' | 'template'>('original');
+  const [selectedTemplate, setSelectedTemplate] = useState<string>('original');
+  const [templatePreview, setTemplatePreview] = useState<string>('');
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
-      setFile(e.target.files[0]);
-      setFileName(e.target.files[0].name);
-    }
-  };
-
-  const extractTextFromFile = async (file: File): Promise<string> => {
-    try {
-      const result = await parseDocument(file);
+      const selectedFile = e.target.files[0];
+      setFile(selectedFile);
+      setFileName(selectedFile.name);
+      setFileError(null);
       
-      if (result.error) {
-        throw new Error(result.error);
+      try {
+        setIsProcessingFile(true);
+        const result = await parseDocument(selectedFile);
+        
+        if (result.error) {
+          throw new Error(result.error);
+        }
+        
+        setResumeText(result.text);
+        setFileFormat(result.format || '');
+        setFileStructure(result.structure || null);
+        
+        // Reset template selection when new file is uploaded
+        setSelectedTemplate('original');
+        setTemplatePreview('');
+        
+      } catch (err) {
+        setFileError(err instanceof Error ? err.message : 'Failed to extract text from file');
+      } finally {
+        setIsProcessingFile(false);
       }
-      
-      return result.text;
-    } catch (error) {
-      console.error('Error extracting text from file:', error);
-      throw new Error(`Failed to extract text from file: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   };
 
@@ -85,6 +112,198 @@ ${resumeText}`
     }
   };
 
+  const enhanceResume = async (jobDescription: string, resumeText: string, missingKeywords: string[], preserveFormat: boolean = true): Promise<ResumeEdit> => {
+    try {
+      const formatPrompt = preserveFormat 
+        ? `Important: Maintain the EXACT same formatting, section structure, and layout as the original resume. Don't add or remove sections.` 
+        : `Optimize the resume format for ATS systems.`;
+
+      const response = await axios.post(
+        'https://api.openai.com/v1/chat/completions',
+        {
+          model: 'gpt-4-turbo',
+          messages: [
+            {
+              role: 'system',
+              content: `You are an expert resume writer who helps job seekers optimize their resumes for specific job descriptions. ${formatPrompt}`
+            },
+            {
+              role: 'user',
+              content: `Enhance this resume to better match the job description. Incorporate the missing keywords naturally and honestly. 
+              Focus on reformatting and rewording existing content rather than inventing new experiences.
+              ${preserveFormat ? 'Remember to preserve the exact same format and layout as the original resume.' : ''}
+              
+              Job Description:
+              ${jobDescription}
+              
+              Resume:
+              ${resumeText}
+              
+              Missing Keywords: ${missingKeywords.join(', ')}
+              
+              Format your response as a JSON object with these properties:
+              - "enhancedText" (string): The complete enhanced resume
+              - "changes" (array of strings): A list of specific improvements made to the resume`
+            }
+          ],
+          response_format: { type: 'json_object' }
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+          }
+        }
+      );
+
+      const result = JSON.parse(response.data.choices[0].message.content);
+      return {
+        originalText: resumeText,
+        enhancedText: result.enhancedText,
+        changes: result.changes
+      };
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response) {
+        console.error('OpenAI API error:', error.response.data);
+        throw new Error(`OpenAI API error: ${error.response.data.error?.message || 'Unknown API error'}`);
+      }
+      console.error('Error enhancing resume:', error);
+      throw new Error('Failed to enhance resume with OpenAI API');
+    }
+  };
+  
+  const retryFileUpload = async () => {
+    if (!file) return;
+    
+    setFileError(null);
+    try {
+      setIsProcessingFile(true);
+      const result = await parseDocument(file);
+      
+      if (result.error) {
+        throw new Error(result.error);
+      }
+      
+      setResumeText(result.text);
+      setFileFormat(result.format || '');
+      setFileStructure(result.structure || null);
+    } catch (err) {
+      setFileError(err instanceof Error ? err.message : 'Failed to extract text from file');
+    } finally {
+      setIsProcessingFile(false);
+    }
+  };
+
+  const handleResumeTextChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setResumeText(e.target.value);
+    // Reset results when resume text changes
+    if (resumeEdit) {
+      setResumeEdit(null);
+    }
+    if (keywordResult) {
+      setKeywordResult(null);
+    }
+  };
+
+  const handleTemplateChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const template = e.target.value;
+    setSelectedTemplate(template);
+    
+    if (template !== 'original' && resumeEdit) {
+      const formattedResume = applyResumeTemplate(resumeEdit.enhancedText, template);
+      setTemplatePreview(formattedResume);
+      setActiveTab('template');
+    } else if (template === 'original' && resumeEdit) {
+      setActiveTab('enhanced');
+    }
+  };
+
+  const downloadAsTxt = () => {
+    if (!resumeEdit) return;
+    
+    let textToDownload = '';
+    
+    if (activeTab === 'original') {
+      textToDownload = resumeEdit.originalText;
+    } else if (activeTab === 'enhanced') {
+      textToDownload = resumeEdit.enhancedText;
+    } else if (activeTab === 'template') {
+      textToDownload = templatePreview;
+    }
+    
+    const element = document.createElement('a');
+    const file = new Blob([textToDownload], {type: 'text/plain'});
+    element.href = URL.createObjectURL(file);
+    
+    // Generate filename
+    const fileNameWithoutExtension = fileName.split('.')[0] || 'resume';
+    let suffix = '';
+    
+    if (activeTab === 'enhanced') {
+      suffix = '_enhanced';
+    } else if (activeTab === 'template') {
+      suffix = `_${selectedTemplate}`;
+    }
+    
+    element.download = `${fileNameWithoutExtension}${suffix}.txt`;
+    
+    document.body.appendChild(element);
+    element.click();
+    document.body.removeChild(element);
+  };
+
+  const downloadAsDocx = async () => {
+    if (!resumeEdit) return;
+    
+    let textToDownload = '';
+    
+    if (activeTab === 'original') {
+      textToDownload = resumeEdit.originalText;
+    } else if (activeTab === 'enhanced') {
+      textToDownload = resumeEdit.enhancedText;
+    } else if (activeTab === 'template') {
+      textToDownload = templatePreview;
+    }
+    
+    // Split resume text into lines for paragraphs
+    const lines = textToDownload.split('\n');
+    
+    // Create document
+    const doc = new Document({
+      sections: [
+        {
+          properties: {},
+          children: lines.map(line => 
+            new Paragraph({
+              children: [new TextRun(line)],
+              spacing: {
+                after: 200
+              }
+            })
+          )
+        }
+      ]
+    });
+    
+    // Generate blob from document
+    const blob = await Packer.toBlob(doc);
+    
+    // Determine filename
+    const fileNameWithoutExtension = fileName.split('.')[0] || 'resume';
+    let suffix = '';
+    
+    if (activeTab === 'enhanced') {
+      suffix = '_enhanced';
+    } else if (activeTab === 'template') {
+      suffix = `_${selectedTemplate}`;
+    }
+    
+    const docxFileName = `${fileNameWithoutExtension}${suffix}.docx`;
+    
+    // Save file
+    saveAs(blob, docxFileName);
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
@@ -94,8 +313,8 @@ ${resumeText}`
       return;
     }
     
-    if (!file) {
-      setError('Please upload a resume');
+    if (!resumeText) {
+      setError('Please upload a resume or enter resume text');
       return;
     }
     
@@ -107,9 +326,24 @@ ${resumeText}`
     setLoading(true);
     
     try {
-      const resumeText = await extractTextFromFile(file);
+      // First analyze keywords
       const analysis = await analyzeKeywords(jobDescription, resumeText);
-      setResult(analysis);
+      setKeywordResult(analysis);
+      
+      // Then enhance the resume based on missing keywords
+      if (analysis.missingKeywords.length > 0) {
+        // Pass preserveFormat=true to maintain original format
+        const enhancedResume = await enhanceResume(jobDescription, resumeText, analysis.missingKeywords, true);
+        setResumeEdit(enhancedResume);
+        
+        // Reset template view
+        setSelectedTemplate('original');
+        setTemplatePreview('');
+        
+        // Switch to enhanced tab
+        setActiveTab('enhanced');
+      }
+      
       // Scroll to results
       setTimeout(() => {
         const resultsElement = document.getElementById('results-section');
@@ -124,11 +358,18 @@ ${resumeText}`
     }
   };
 
+  const handlePasteManually = () => {
+    setFileError(null);
+    setResumeText('');
+    setFile(null);
+    setFileName('');
+  };
+
   return (
     <div className="container">
-      <h1>Resume Keyword Checker</h1>
+      <h1>Resume Optimizer</h1>
       <p className="description">
-        Enter a job description and upload your resume to see which keywords you might be missing.
+        Upload your resume and enter a job description to get real-time optimization suggestions.
       </p>
       
       <form onSubmit={handleSubmit}>
@@ -164,45 +405,88 @@ ${resumeText}`
               id="resume"
               onChange={handleFileChange}
               accept=".txt,.pdf,.docx,.doc"
-              required
               style={{ display: 'none' }}
             />
             <label htmlFor="resume" className="file-input-button">
-              Choose File
+              Upload Resume
             </label>
             {fileName && <span className="file-name">{fileName}</span>}
+            {isProcessingFile && <span className="file-loading">Processing file...</span>}
           </div>
           <small>Supported formats: .txt, .pdf, .docx, .doc</small>
+          
+          {fileError && (
+            <div className="file-error">
+              <div className="error-message">
+                <strong>Error:</strong> {fileError}
+              </div>
+              <div className="error-actions">
+                <button type="button" className="retry-button" onClick={retryFileUpload}>
+                  Reload
+                </button>
+                <button 
+                  type="button" 
+                  className="manual-entry-button"
+                  onClick={handlePasteManually}
+                >
+                  Paste Text Manually
+                </button>
+              </div>
+            </div>
+          )}
+          
+          {(!resumeText && !fileError) || (fileError && !resumeText) ? (
+            <div className="resume-text-container manual-mode">
+              <label htmlFor="resumeTextManual">Or paste your resume content directly:</label>
+              <textarea
+                id="resumeTextManual"
+                value={resumeText}
+                onChange={handleResumeTextChange}
+                placeholder="Paste your resume content here..."
+                rows={10}
+              />
+            </div>
+          ) : resumeText && !fileError ? (
+            <div className="resume-text-container">
+              <label htmlFor="resumeText">Resume Content:</label>
+              <textarea
+                id="resumeText"
+                value={resumeText}
+                onChange={handleResumeTextChange}
+                placeholder="Your resume content will appear here. You can edit it if needed."
+              />
+            </div>
+          ) : null}
         </div>
         
         <button type="submit" disabled={loading}>
           {loading ? (
             <>
               <span className="loading-spinner"></span>
-              Analyzing...
+              Optimizing Resume...
             </>
           ) : (
-            'Analyze Resume'
+            'Optimize Resume'
           )}
         </button>
       </form>
       
       {error && <div className="error">{error}</div>}
       
-      {result && (
+      {keywordResult && (
         <div id="results-section" className="results">
           <h2>Analysis Results</h2>
           <div className="score">
-            Match Score: {result.score}%
+            Match Score: {keywordResult.score}%
           </div>
           
           <div className="keywords-section">
             <h3>Important Job Keywords</h3>
             <div className="keyword-list">
-              {result.jobKeywords.map((keyword, index) => (
+              {keywordResult.jobKeywords.map((keyword, index) => (
                 <span 
                   key={index} 
-                  className={result.missingKeywords.includes(keyword) ? 'keyword missing' : 'keyword matched'}
+                  className={keywordResult.missingKeywords.includes(keyword) ? 'keyword missing' : 'keyword matched'}
                 >
                   {keyword}
                 </span>
@@ -212,9 +496,9 @@ ${resumeText}`
           
           <div className="keywords-section">
             <h3>Missing Keywords</h3>
-            {result.missingKeywords.length > 0 ? (
+            {keywordResult.missingKeywords.length > 0 ? (
               <div className="keyword-list">
-                {result.missingKeywords.map((keyword, index) => (
+                {keywordResult.missingKeywords.map((keyword, index) => (
                   <span key={index} className="keyword missing">{keyword}</span>
                 ))}
               </div>
@@ -223,22 +507,78 @@ ${resumeText}`
             )}
           </div>
           
-          <div className="keywords-section">
-            <h3>Matched Keywords</h3>
-            <div className="keyword-list">
-              {result.matchedKeywords.map((keyword, index) => (
-                <span key={index} className="keyword matched">{keyword}</span>
-              ))}
+          {resumeEdit && (
+            <div className="resume-editor">
+              <h2>Resume Editor</h2>
+              
+              <div className="format-controls">
+                <div className="template-selector">
+                  <label htmlFor="template-select">Format Options:</label>
+                  <select 
+                    id="template-select" 
+                    value={selectedTemplate}
+                    onChange={handleTemplateChange}
+                  >
+                    <option value="original">Preserve Original Format</option>
+                    <option value="professional">Professional Template</option>
+                    <option value="modern">Modern Template</option>
+                    <option value="simple">Simple Template</option>
+                    <option value="academic">Academic Template</option>
+                  </select>
+                </div>
+              </div>
+              
+              <div className="tabs">
+                <button 
+                  className={activeTab === 'original' ? 'tab active' : 'tab'}
+                  onClick={() => setActiveTab('original')}
+                >
+                  Original
+                </button>
+                <button 
+                  className={activeTab === 'enhanced' ? 'tab active' : 'tab'}
+                  onClick={() => setActiveTab('enhanced')}
+                >
+                  Enhanced
+                </button>
+                {templatePreview && (
+                  <button 
+                    className={activeTab === 'template' ? 'tab active' : 'tab'}
+                    onClick={() => setActiveTab('template')}
+                  >
+                    Template View
+                  </button>
+                )}
+                <div className="download-options">
+                  <button className="tab-action" onClick={downloadAsTxt}>
+                    Download as TXT
+                  </button>
+                  <button className="tab-action" onClick={downloadAsDocx}>
+                    Download as DOCX
+                  </button>
+                </div>
+              </div>
+              
+              <div className="resume-content">
+                {activeTab === 'original' ? (
+                  <pre>{resumeEdit.originalText}</pre>
+                ) : activeTab === 'enhanced' ? (
+                  <pre>{resumeEdit.enhancedText}</pre>
+                ) : (
+                  <pre>{templatePreview}</pre>
+                )}
+              </div>
+              
+              <div className="changes-section">
+                <h3>Improvements Made:</h3>
+                <ul>
+                  {resumeEdit.changes.map((change, index) => (
+                    <li key={index}>{change}</li>
+                  ))}
+                </ul>
+              </div>
             </div>
-          </div>
-          
-          <div className="recommendations">
-            <h3>Recommendations</h3>
-            <p>
-              Consider adding the missing keywords to your resume to improve your chances of getting past ATS systems. 
-              Make sure to incorporate them naturally and honestly based on your actual skills and experience.
-            </p>
-          </div>
+          )}
         </div>
       )}
     </div>
